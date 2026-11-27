@@ -36,6 +36,24 @@ If `@RateLimit` is used with `@Bulkhead`, the rate limit is enforced before enfo
 
 If `@Timeout` is used with `@Bulkhead`, the timeout watcher is started before enforcing the concurrency limit.
 
+For an asynchronous invocation, the time spent waiting in the bulkhead queue counts toward the timeout.
+If the timeout elapses while the invocation is still waiting in the queue, the queued task is withdrawn before the caller observes the `TimeoutException`:
+
+* it leaves the queue and releases the one capacity permit it acquired when it was accepted into the bulkhead (it never acquired a work permit, so the work semaphore is not touched);
+* the guarded method is never invoked, so no side effects of an invocation the caller has already given up on happen later;
+* a `FinishedWaiting` event is fired (balancing the earlier `StartedWaiting`), so `ft.bulkhead.executionsWaiting` decrements and one `ft.bulkhead.waitingDuration` sample is recorded, because the invocation really did wait; no `StartedRunning`/`FinishedRunning` events are fired;
+* the withdrawal counts as the single `accepted` bulkhead decision and never adds a `rejected`.
+
+A task that has already started running when the timeout elapses is not forcefully stopped; it runs to completion and releases its permits through the normal path.
+
+The bulkhead learns about the timeout through an internal "invocation abandoned" event that the timeout strategy fires when the caller gives up on an asynchronous invocation.
+This is a dedicated event rather than a handler on the timeout's own finished event, because it describes the caller's state (the result is no longer wanted) instead of one strategy's outcome, so other sources of abandonment besides a timeout can reuse the same mechanism.
+Withdrawal and dequeue are adjudicated by a single atomic compare-and-swap on the task state: the thread that polls the task out of the queue switches it from waiting to running before invoking it, and the switch succeeding is the point of no return, after which a timeout can no longer withdraw the task.
+Dequeue is chosen as the winning side so that the thread holding a work permit never ends up running a withdrawn task.
+A thread that polls a task which was withdrawn in parallel releases the work permit it acquired and continues with the next queued task, instead of stopping with a free permit and a non-empty queue.
+The capacity permit is released exactly once, by whichever side wins the state transition.
+When `@Retry` is present, each attempt registers its own abandonment handler for its own bulkhead task; because handlers are append-only and never removed, a handler only ever acts on the task of the attempt that registered it, so two attempts can never release the same permit twice.
+
 [[configuration]]
 == Configuration
 

@@ -15,6 +15,7 @@ import io.smallrye.faulttolerance.core.Completer;
 import io.smallrye.faulttolerance.core.FaultToleranceContext;
 import io.smallrye.faulttolerance.core.FaultToleranceStrategy;
 import io.smallrye.faulttolerance.core.Future;
+import io.smallrye.faulttolerance.core.InvocationAbandonedEvent;
 import io.smallrye.faulttolerance.core.async.FutureCancellationEvent;
 import io.smallrye.faulttolerance.core.util.RunnableWrapper;
 
@@ -29,6 +30,10 @@ import io.smallrye.faulttolerance.core.util.RunnableWrapper;
  * It also allows synchronous queueing, which is an implementation of a thread pool
  * bulkhead for pseudo-asynchronous invocations. Those are already offloaded to
  * an extra thread and so don't require proper queueing, just two semaphores.
+ * <p>
+ * An async task that is still waiting in the queue may be withdrawn when the caller
+ * abandons the invocation (for example because a timeout elapsed). See
+ * {@link InvocationAbandonedEvent} and {@link BulkheadTask} for the concurrency protocol.
  */
 public class Bulkhead<V> implements FaultToleranceStrategy<V> {
     private final FaultToleranceStrategy<V> delegate;
@@ -180,6 +185,16 @@ public class Bulkhead<V> implements FaultToleranceStrategy<V> {
 
             BulkheadTask task = new BulkheadTask(ctx);
             queue.addLast(task);
+
+            // Event handlers are append-only and never removed, so with a retry, a second attempt
+            // registers a second handler on the same context and a later `InvocationAbandonedEvent`
+            // invokes all handlers registered by all attempts. The handler therefore closes over
+            // exactly this task and only ever touches that task; an older attempt's handler can no
+            // longer do anything once that task has been withdrawn or started running (its state CAS
+            // fails). This mirrors the `threadToCancel.getAndSet(null)` pattern in
+            // `applySyncWithQueueing`, which solves the same problem on the sync path.
+            ctx.registerEventHandler(InvocationAbandonedEvent.class, ignored -> task.abandon());
+
             runQueuedTask();
             return task.result.future();
         } else {
@@ -205,8 +220,18 @@ public class Bulkhead<V> implements FaultToleranceStrategy<V> {
             if (workSemaphore.tryAcquire()) {
                 BulkheadTask queuedTask = queue.pollFirst();
                 if (queuedTask != null) {
-                    LOG.trace("Work semaphore acquired, running task");
-                    loop = queuedTask.run();
+                    if (queuedTask.beginRunning()) {
+                        // dequeue is the point of no return: the task has started running and may
+                        // no longer be withdrawn, so the work permit is consumed by this task
+                        LOG.trace("Work semaphore acquired, running task");
+                        loop = queuedTask.run();
+                    } else {
+                        // the task was withdrawn after it was polled but before it could start;
+                        // it never held the work permit, so hand it straight to the next task
+                        // instead of ending the loop with a free permit and a non-empty queue
+                        workSemaphore.release();
+                        loop = true;
+                    }
                 } else {
                     workSemaphore.release();
                 }
@@ -225,13 +250,20 @@ public class Bulkhead<V> implements FaultToleranceStrategy<V> {
     }
 
     private class BulkheadTask {
+        // The task is created in the WAITING state and stays there while it is sitting in the queue.
+        // Dequeue (`runQueuedTask`) and withdrawal (`abandon`) race on a single CAS out of WAITING:
+        // exactly one side wins and is responsible for releasing the capacity permit, so the permit
+        // is released at most once. The work semaphore is never touched here, because a waiting task
+        // never acquires a work permit.
+        private static final int WAITING = -1;
         private static final int RUNNING = 0;
         private static final int COMPLETED_SYNC = 1;
         private static final int WILL_COMPLETE_ASYNC = 2;
+        private static final int ABANDONED = 3;
 
         private final Completer<V> result = Completer.create();
         private final FaultToleranceContext<V> ctx;
-        private final AtomicInteger state = new AtomicInteger(RUNNING);
+        private final AtomicInteger state = new AtomicInteger(WAITING);
 
         // queued task runs on a thread that completed a previous task, so the thread contexts
         // of this task must be captured here, when the task is created, and restored in `run()`
@@ -239,6 +271,53 @@ public class Bulkhead<V> implements FaultToleranceStrategy<V> {
 
         private BulkheadTask(FaultToleranceContext<V> ctx) {
             this.ctx = ctx;
+        }
+
+        /**
+         * Claims this task for execution. Must be called by the thread that polled the task
+         * out of the queue, before {@link #run()}.
+         *
+         * @return {@code true} if this task has started running and the caller may proceed
+         *         to invoke {@link #run()}; {@code false} if the task was withdrawn while
+         *         it was being dequeued, in which case it must not be run
+         */
+        boolean beginRunning() {
+            // dequeue is the point of no return: once this CAS succeeds, a later `abandon()`
+            // cannot withdraw the task and an already running task is never forcefully stopped
+            return state.compareAndSet(WAITING, RUNNING);
+        }
+
+        /**
+         * Withdraws this task because the caller abandoned the invocation. Only a task that
+         * is still waiting in the queue is withdrawn; a task that has started running keeps
+         * running and is released through its normal completion path.
+         */
+        void abandon() {
+            if (!state.compareAndSet(WAITING, ABANDONED)) {
+                // the task already started running (or was already withdrawn); a running task
+                // is not forcefully stopped and its capacity permit is released on completion
+                return;
+            }
+
+            // Remove the task from the queue if it is still there. It may already have been polled
+            // out by a thread that is about to call `beginRunning()`; that thread loses the state CAS
+            // and releases the work permit it acquired itself. Either way, this side owns the single
+            // capacity permit held on the task's behalf and is the only one to release it, because the
+            // CAS above guarantees withdrawal happens at most once.
+            queue.remove(this);
+            releaseCapacityPermit();
+
+            // A withdrawn task never started, so there is no StartedRunning/FinishedRunning pair.
+            // FinishedWaiting balances the StartedWaiting fired when the task entered the bulkhead,
+            // so waiting metrics decrement exactly once.
+            ctx.fireEvent(BulkheadEvents.FinishedWaiting.INSTANCE);
+
+            LOG.tracef("%s bulkhead task withdrawn after the invocation was abandoned", description);
+
+            // Complete the task's own result deterministically, so that everything attached to it
+            // (the `then` callback of the outer Timeout and the whole context chain) can be released.
+            // The outer result is already completed with TimeoutException and must not be touched.
+            result.completeWithError(new CancellationException(description + " bulkhead task abandoned"));
         }
 
         /**
@@ -288,6 +367,10 @@ public class Bulkhead<V> implements FaultToleranceStrategy<V> {
             workSemaphore.release();
             LOG.trace("Work semaphore released, task finished");
 
+            releaseCapacityPermit();
+        }
+
+        private void releaseCapacityPermit() {
             capacitySemaphore.release();
             LOG.trace("Capacity semaphore released, task leaving bulkhead");
         }

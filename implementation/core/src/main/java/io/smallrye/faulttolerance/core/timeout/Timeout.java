@@ -13,6 +13,7 @@ import io.smallrye.faulttolerance.core.Completer;
 import io.smallrye.faulttolerance.core.FaultToleranceContext;
 import io.smallrye.faulttolerance.core.FaultToleranceStrategy;
 import io.smallrye.faulttolerance.core.Future;
+import io.smallrye.faulttolerance.core.InvocationAbandonedEvent;
 import io.smallrye.faulttolerance.core.timer.Timer;
 import io.smallrye.faulttolerance.core.timer.TimerTask;
 
@@ -47,6 +48,14 @@ public class Timeout<V> implements FaultToleranceStrategy<V> {
             TimeoutExecution execution = new TimeoutExecution(executingThread, () -> {
                 LOG.debugf("%s invocation timed out (%d ms)", description, timeoutInMillis);
                 ctx.fireEvent(TimeoutEvents.Finished.TIMED_OUT);
+                if (ctx.isAsync()) {
+                    // For a truly asynchronous invocation, there is no executing thread to interrupt,
+                    // so the guarded invocation may still be waiting in a bulkhead queue or running.
+                    // Notify strategies that the caller has given up, so that resources held on behalf
+                    // of this invocation (e.g. a bulkhead queue slot) can be released before the outer
+                    // result is completed with the timeout exception.
+                    ctx.fireEvent(InvocationAbandonedEvent.INSTANCE);
+                }
                 TimeoutException timeout = new TimeoutException(description + " timed out");
                 if (notification != null) {
                     notification.accept(timeout);
